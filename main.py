@@ -3,9 +3,9 @@ import json
 import ast
 import difflib
 import pandas as pd
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from unidecode import unidecode
@@ -36,6 +36,7 @@ def safe_parse_json(texto: Any) -> Any:
     txt = str(texto).strip()
     if not txt:
         return None
+    # Tenta JSON → depois literal_eval → por fim marca como _raw
     try:
         return json.loads(txt)
     except Exception:
@@ -103,13 +104,81 @@ def selecionar_por_nome(
 
     return {"status": "nao_encontrado", "opcoes": []}
 
-# ========= Pydantic =========
+# --- utils para o quadro comparativo ---
+def get_by_path(obj: Any, path: Optional[str]) -> Any:
+    """
+    Navega por caminho pontuado (ex.: 'internacoes.2025.total' ou 'itens.0.valor').
+    Se path=None/"" → retorna o obj inteiro.
+    """
+    if path is None or str(path).strip() == "":
+        return obj
+    cur = obj
+    for part in [p for p in str(path).split(".") if p != ""]:
+        if isinstance(cur, dict):
+            if part not in cur:
+                return None
+            cur = cur[part]
+        elif isinstance(cur, list):
+            try:
+                idx = int(part)
+            except ValueError:
+                return None
+            if idx < 0 or idx >= len(cur):
+                return None
+            cur = cur[idx]
+        else:
+            return None
+    return cur
+
+def summarize_value(value: Any, max_chars: int = 400) -> str:
+    """
+    Gera um resumo textual curto para listas/dicts/strings.
+    - Lista de objetos: tenta extrair campos comuns (texto, clausula, descricao, titulo, item).
+    - Dict: tenta pegar um campo textual ou lista chaves.
+    - String/num: devolve a string (limitada).
+    """
+    if value is None:
+        return ""
+    try:
+        if isinstance(value, list):
+            parts = []
+            for el in value[:5]:  # limita para não estourar
+                if isinstance(el, dict):
+                    txt = el.get("texto") or el.get("texto_clausula") or el.get("clausula") \
+                          or el.get("descricao") or el.get("titulo") or el.get("item")
+                    if txt:
+                        parts.append(str(txt))
+                    else:
+                        keys = list(el.keys())[:4]
+                        parts.append(" | ".join(f"{k}: {el[k]}" for k in keys))
+                else:
+                    parts.append(str(el))
+            s = " • ".join(parts)
+            return (s[:max_chars] + "…") if len(s) > max_chars else s
+
+        if isinstance(value, dict):
+            txt = value.get("texto") or value.get("texto_clausula") or value.get("clausula") \
+                  or value.get("descricao") or value.get("titulo")
+            if txt:
+                s = str(txt)
+                return (s[:max_chars] + "…") if len(s) > max_chars else s
+            keys = list(value.keys())[:10]
+            s = "{" + ", ".join(keys) + "}"
+            return (s[:max_chars] + "…") if len(s) > max_chars else s
+
+        s = str(value)
+        return (s[:max_chars] + "…") if len(s) > max_chars else s
+    except Exception:
+        s = str(value)
+        return (s[:max_chars] + "…") if len(s) > max_chars else s
+
+# ========= Pydantic (request/response) =========
 class Selector(BaseModel):
     nome_hospital: str
 
 class AvaliarVariaveisRequest(BaseModel):
     selector: Selector
-    # Se não vier, autodetecta as colunas JSON
+    # Se não vier, vamos autodetectar as colunas JSON
     variaveis: Optional[List[str]] = None
 
 # ========= FastAPI App =========
@@ -125,7 +194,7 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"ok": True, "endpoints": ["/health", "/listar_hospitais", "/list_json_vars", "/avaliar_variaveis_json"]}
+    return {"ok": True, "endpoints": ["/health", "/list_json_vars", "/avaliar_variaveis_json", "/quadro_variavel", "/quadro_variaveis"]}
 
 @app.get("/health")
 def health():
@@ -136,28 +205,10 @@ def list_json_vars():
     df = load_df()
     return {"json_vars": detectar_colunas_json(df)}
 
-@app.get("/listar_hospitais")
-def listar_hospitais(q: Optional[str] = Query(default=None, description="Filtro por nome (parcial)"),
-                     limit: int = Query(default=500, ge=1, le=10000)):
-    df = load_df()
-    if "nome_hospital" not in df.columns:
-        return {"total": 0, "items": []}
-
-    nomes = df["nome_hospital"].dropna().astype(str)
-
-    if q and q.strip():
-        alvo = norm(q)
-        nomes_norm = nomes.map(norm)
-        mask = nomes_norm.str.contains(alvo, regex=False, na=False)
-        nomes = nomes[mask]
-
-    nomes = nomes.drop_duplicates().sort_values().head(limit)
-    return {"total": int(nomes.shape[0]), "items": nomes.tolist()}
-
 @app.post("/avaliar_variaveis_json")
 def avaliar_variaveis_json(body: AvaliarVariaveisRequest):
     """
-    Body exemplo:
+    Exemplo de body:
     {
       "selector": { "nome_hospital": "Sorocaba" },
       "variaveis": ["Metas", "Pagamento"]   # opcional; se faltar, autodetecta colunas JSON
@@ -199,3 +250,71 @@ def avaliar_variaveis_json(body: AvaliarVariaveisRequest):
 
     return {"ok": True, "hospital": {"nome_hospital": row.get("nome_hospital")}, "resultados": resultados}
 
+# ========= NOVOS ENDPOINTS: quadros comparativos =========
+@app.get("/quadro_variavel")
+def quadro_variavel(
+    var: str = Query(..., description="Nome da coluna/variável (ex.: Metas, Pagamento, Indicadores de Qualidade)"),
+    path: Optional[str] = Query(None, description="Caminho pontuado dentro do JSON (ex.: internacoes.2025.total)"),
+    include_bruto: bool = Query(False, description="Se True, inclui o JSON bruto extraído"),
+    max_chars: int = Query(400, ge=50, le=2000, description="Tamanho máximo do resumo textual por hospital"),
+    limit: int = Query(10000, ge=1, le=100000, description="Máximo de linhas (hospitais) retornadas"),
+    sort: str = Query("none", pattern="^(asc|desc|none)$", description="Ordenação por resumo textual"),
+):
+    """
+    Monta um 'quadro' (tabela) com a variável indicada para TODOS os hospitais.
+    Não exige valores numéricos; serve para conteúdo qualitativo.
+    """
+    df = load_df()
+    if var not in df.columns:
+        return {"total": 0, "columns": ["nome_hospital", var], "items": [], "error": f"Variável '{var}' não existe."}
+
+    items = []
+    for _, row in df.head(limit).iterrows():
+        nh = row.get("nome_hospital", "")
+        raw = row.get(var, None)
+        parsed = safe_parse_json(raw)
+        extracted = get_by_path(parsed, path) if parsed is not None else None
+        resumo = summarize_value(extracted, max_chars=max_chars)
+        item = {"nome_hospital": nh, "valor": resumo}
+        if include_bruto:
+            item["bruto"] = extracted
+        items.append(item)
+
+    if sort != "none":
+        items = sorted(items, key=lambda x: (x["valor"] is None, str(x["valor"])), reverse=(sort == "desc"))
+
+    cols = ["nome_hospital", "valor"] + (["bruto"] if include_bruto else [])
+    return {"total": len(items), "columns": cols, "items": items}
+
+@app.post("/quadro_variaveis")
+def quadro_variaveis(
+    vars: List[str] = Body(..., embed=True, description="Lista de variáveis para comparar em TODOS os hospitais"),
+    path: Optional[str] = Query(None, description="Caminho pontuado (opcional), aplicado a TODAS as variáveis"),
+    include_bruto: bool = Query(False, description="Se True, inclui o JSON bruto extraído"),
+    max_chars: int = Query(200, ge=50, le=2000, description="Resumo textual máximo por célula"),
+    limit: int = Query(10000, ge=1, le=100000, description="Máximo de hospitais"),
+):
+    """
+    Tabelão 'largo': múltiplas variáveis por hospital.
+    Para cada hospital e cada variável, cria uma coluna com o resumo textual.
+    """
+    df = load_df()
+    for v in vars:
+        if v not in df.columns:
+            return {"total": 0, "columns": [], "items": [], "error": f"Variável '{v}' não existe."}
+
+    items = []
+    for _, row in df.head(limit).iterrows():
+        nh = row.get("nome_hospital", "")
+        out_row: Dict[str, Any] = {"nome_hospital": nh}
+        for v in vars:
+            raw = row.get(v, None)
+            parsed = safe_parse_json(raw)
+            extracted = get_by_path(parsed, path) if parsed is not None else None
+            out_row[v] = summarize_value(extracted, max_chars=max_chars)
+            if include_bruto:
+                out_row[f"{v}__bruto"] = extracted
+        items.append(out_row)
+
+    columns = ["nome_hospital"] + vars + ([f"{v}__bruto" for v in vars] if include_bruto else [])
+    return {"total": len(items), "columns": columns, "items": items}
