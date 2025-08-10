@@ -5,7 +5,7 @@ import difflib
 import pandas as pd
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from unidecode import unidecode
@@ -14,7 +14,6 @@ from unidecode import unidecode
 DB_PATH = os.getenv("HOSPITAIS_CSV", "hospitais_BD_final.csv")
 
 _df_cache: Optional[pd.DataFrame] = None
-
 
 # ========= Utils =========
 def load_df() -> pd.DataFrame:
@@ -28,10 +27,8 @@ def load_df() -> pd.DataFrame:
             raise HTTPException(status_code=500, detail=f"Falha ao ler CSV: {e}")
     return _df_cache
 
-
 def norm(s: Any) -> str:
     return unidecode(str(s or "")).strip().lower()
-
 
 def safe_parse_json(texto: Any) -> Any:
     if texto is None:
@@ -39,7 +36,6 @@ def safe_parse_json(texto: Any) -> Any:
     txt = str(texto).strip()
     if not txt:
         return None
-    # Tenta JSON → depois literal_eval → por fim marca como _raw
     try:
         return json.loads(txt)
     except Exception:
@@ -47,7 +43,6 @@ def safe_parse_json(texto: Any) -> Any:
             return ast.literal_eval(txt)
         except Exception:
             return {"_raw": txt, "_parsed": False}
-
 
 def detectar_colunas_json(df: pd.DataFrame, limite: int = 200) -> List[str]:
     """Detecta colunas que parecem conter JSON em pelo menos uma linha."""
@@ -60,7 +55,6 @@ def detectar_colunas_json(df: pd.DataFrame, limite: int = 200) -> List[str]:
                 cols.append(c)
                 break
     return cols
-
 
 def selecionar_por_nome(
     df: pd.DataFrame,
@@ -109,17 +103,14 @@ def selecionar_por_nome(
 
     return {"status": "nao_encontrado", "opcoes": []}
 
-
-# ========= Pydantic (request/response) =========
+# ========= Pydantic =========
 class Selector(BaseModel):
     nome_hospital: str
 
-
 class AvaliarVariaveisRequest(BaseModel):
     selector: Selector
-    # Se não vier, vamos autodetectar as colunas JSON
+    # Se não vier, autodetecta as colunas JSON
     variaveis: Optional[List[str]] = None
-
 
 # ========= FastAPI App =========
 app = FastAPI(title="Ações do Banco de Hospitais", version="1.0.0")
@@ -132,22 +123,41 @@ app.add_middleware(
     allow_methods=["*"],
 )
 
+@app.get("/")
+def root():
+    return {"ok": True, "endpoints": ["/health", "/listar_hospitais", "/list_json_vars", "/avaliar_variaveis_json"]}
 
 @app.get("/health")
 def health():
     return {"ok": True}
-
 
 @app.get("/list_json_vars")
 def list_json_vars():
     df = load_df()
     return {"json_vars": detectar_colunas_json(df)}
 
+@app.get("/listar_hospitais")
+def listar_hospitais(q: Optional[str] = Query(default=None, description="Filtro por nome (parcial)"),
+                     limit: int = Query(default=500, ge=1, le=10000)):
+    df = load_df()
+    if "nome_hospital" not in df.columns:
+        return {"total": 0, "items": []}
+
+    nomes = df["nome_hospital"].dropna().astype(str)
+
+    if q and q.strip():
+        alvo = norm(q)
+        nomes_norm = nomes.map(norm)
+        mask = nomes_norm.str.contains(alvo, regex=False, na=False)
+        nomes = nomes[mask]
+
+    nomes = nomes.drop_duplicates().sort_values().head(limit)
+    return {"total": int(nomes.shape[0]), "items": nomes.tolist()}
 
 @app.post("/avaliar_variaveis_json")
 def avaliar_variaveis_json(body: AvaliarVariaveisRequest):
     """
-    Exemplo de body:
+    Body exemplo:
     {
       "selector": { "nome_hospital": "Sorocaba" },
       "variaveis": ["Metas", "Pagamento"]   # opcional; se faltar, autodetecta colunas JSON
@@ -188,3 +198,4 @@ def avaliar_variaveis_json(body: AvaliarVariaveisRequest):
         resultados[var] = safe_parse_json(val)
 
     return {"ok": True, "hospital": {"nome_hospital": row.get("nome_hospital")}, "resultados": resultados}
+
