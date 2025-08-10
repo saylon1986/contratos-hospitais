@@ -172,6 +172,98 @@ def summarize_value(value: Any, max_chars: int = 400) -> str:
         s = str(value)
         return (s[:max_chars] + "…") if len(s) > max_chars else s
 
+
+import re
+
+NUM_RE = re.compile(r"(?<!\d)(\d{1,3}(?:\.\d{3})*|\d+)(?:,\d+)?")
+
+def to_int_count(s: str) -> Optional[int]:
+    if s is None:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    # remove decimais, mantemos contagem inteira
+    s = s.replace(".", "")
+    s = s.split(",")[0]
+    try:
+        return int(s)
+    except Exception:
+        return None
+
+def flatten_text_items(value: Any) -> List[Dict[str, Any]]:
+    """
+    Converte o JSON (já extraído/unwrap) em lista de itens textuais com metadados.
+    Cada item: {"texto": "...", "pagina": ..., "clausula": ...}
+    """
+    out: List[Dict[str, Any]] = []
+    def add(txt, meta=None):
+        meta = meta or {}
+        out.append({
+            "texto": str(txt) if txt is not None else "",
+            "pagina": meta.get("pagina") or meta.get("page") or meta.get("pagina_encontrada"),
+            "clausula": meta.get("clausula") or meta.get("numero") or meta.get("n_clausula"),
+        })
+
+    if isinstance(value, str):
+        add(value, {})
+    elif isinstance(value, dict):
+        # se for um dict com campo textual
+        txt = value.get("texto") or value.get("texto_clausula") or value.get("clausula") or value.get("descricao") or value.get("titulo")
+        if txt:
+            add(txt, value)
+        # também varre listas internas comuns
+        for k, v in list(value.items()):
+            if isinstance(v, list):
+                for el in v:
+                    if isinstance(el, dict):
+                        t = el.get("texto") or el.get("texto_clausula") or el.get("clausula") or el.get("descricao") or el.get("titulo")
+                        if t:
+                            add(t, el)
+                    elif isinstance(el, str):
+                        add(el, {})
+    elif isinstance(value, list):
+        for el in value:
+            if isinstance(el, dict):
+                t = el.get("texto") or el.get("texto_clausula") or el.get("clausula") or el.get("descricao") or el.get("titulo")
+                if t:
+                    add(t, el)
+            elif isinstance(el, str):
+                add(el, {})
+    return out
+
+def find_numbers_near_keywords(text: str, keywords: List[str], window: int = 60) -> List[Dict[str, Any]]:
+    """
+    Procura números próximos das keywords (antes/depois, janela em caracteres).
+    Retorna lista de matches com {"num": int, "span": (i,j), "kw": <kw>, "contexto": <trecho>}
+    """
+    results: List[Dict[str, Any]] = []
+    low = text.lower()
+    for kw in keywords:
+        q = kw.strip().lower()
+        start = 0
+        while True:
+            idx = low.find(q, start)
+            if idx == -1:
+                break
+            a = max(0, idx - window)
+            b = min(len(text), idx + len(q) + window)
+            trecho = text[a:b]
+            # busca números no trecho
+            for m in NUM_RE.finditer(trecho):
+                n = to_int_count(m.group(1))
+                if n is not None:
+                    results.append({
+                        "num": n,
+                        "span": (a + m.start(), a + m.end()),
+                        "kw": kw,
+                        "contexto": trecho.strip()
+                    })
+            start = idx + len(q)
+    return results
+
+
+
 # ==== Heurísticas genéricas: auto-unwrap + escolha automática de path ====
 def auto_unwrap(value, max_depth=2):
     """
@@ -439,6 +531,91 @@ def quadro_variaveis(
     return {
         "total": len(items),
         "columns": columns,
+        "items": items,
+        "page": {"offset": offset, "limit": limit, "total_available": total_available}
+    }
+
+
+@app.get("/extrair_metricas")
+def extrair_metricas(
+    var: str = Query(..., description="Nome da coluna/variável onde buscar (ex.: Metas)"),
+    keywords: str = Query(..., description="Palavras-chave separadas por vírgula (ex.: cirurgia,cirurgias)"),
+    path: Optional[str] = Query(None, description="Caminho pontuado no JSON (opcional)"),
+    agg: str = Query("max", pattern="^(max|first|sum)$", description="Como consolidar múltiplos números por hospital"),
+    window: int = Query(60, ge=10, le=400, description="Janela de busca ao redor das palavras (caracteres)"),
+    limit: int = Query(200, ge=1, le=10000, description="Quantos hospitais retornar"),
+    offset: int = Query(0, ge=0, description="Deslocamento para paginação"),
+    include_context: bool = Query(True, description="Se True, retorna trecho de contexto/página/cláusula")
+):
+    """
+    Para cada hospital, varre a variável 'var', extrai números próximos das 'keywords' e
+    retorna um valor consolidado por hospital (max/first/sum) com contexto.
+    """
+    df = load_df()
+    total_available = len(df)
+    if var not in df.columns:
+        return {
+            "total": 0, "items": [],
+            "error": f"Variável '{var}' não existe.",
+            "page": {"offset": offset, "limit": limit, "total_available": total_available}
+        }
+
+    kws = [k.strip() for k in keywords.split(",") if k.strip()]
+    df_page = df.iloc[offset: offset + limit]
+
+    items = []
+    for _, row in df_page.iterrows():
+        nh = row.get("nome_hospital", "")
+        raw = row.get(var, None)
+        parsed = safe_parse_json(raw)
+
+        if parsed is not None:
+            if path and str(path).strip():
+                extracted = get_by_path(parsed, path)
+            else:
+                unwrapped = auto_unwrap(parsed)
+                bp, bv = pick_best_path(unwrapped, max_depth=3)
+                extracted = bv if bp is not None else unwrapped
+        else:
+            extracted = None
+
+        # transforma em lista de itens textuais
+        text_items = flatten_text_items(extracted)
+        all_nums: List[int] = []
+        best_context = None
+
+        for it in text_items:
+            texto = it.get("texto", "")
+            if not texto.strip():
+                continue
+            matches = find_numbers_near_keywords(texto, kws, window=window)
+            if matches:
+                # guarda números e (primeiro) contexto encontrado
+                all_nums.extend([m["num"] for m in matches])
+                if best_context is None:
+                    best_context = {
+                        "trecho": matches[0]["contexto"],
+                        "pagina": it.get("pagina"),
+                        "clausula": it.get("clausula")
+                    }
+
+        if not all_nums:
+            result_val = None
+        else:
+            if agg == "max":
+                result_val = max(all_nums)
+            elif agg == "sum":
+                result_val = sum(all_nums)
+            else:  # first
+                result_val = all_nums[0]
+
+        out = {"nome_hospital": nh, "valor": result_val}
+        if include_context:
+            out["contexto"] = best_context
+        items.append(out)
+
+    return {
+        "total": len(items),
         "items": items,
         "page": {"offset": offset, "limit": limit, "total_available": total_available}
     }
