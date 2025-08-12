@@ -172,92 +172,6 @@ def summarize_value(value: Any, max_chars: int = 400) -> str:
         s = str(value)
         return (s[:max_chars] + "…") if len(s) > max_chars else s
 
-
-
-# ==== Heurísticas genéricas: auto-unwrap + escolha automática de path ====
-def auto_unwrap(value, max_depth=2):
-    """
-    Se for dict com UMA chave, desce automaticamente (ex.: {'clausulas': [...]})
-    até max_depth vezes.
-    """
-    cur = value
-    depth = 0
-    while isinstance(cur, dict) and len(cur.keys()) == 1 and depth < max_depth:
-        (only_key,) = tuple(cur.keys())
-        cur = cur[only_key]
-        depth += 1
-    return cur
-
-TEXT_KEYS = {"texto","texto_clausula","clausula","descricao","descrição","titulo","título","item","resumo","conteudo"}
-
-def is_texty(x):
-    if x is None:
-        return False
-    if isinstance(x, str) and x.strip():
-        return True
-    if isinstance(x, (int, float)):
-        return True
-    if isinstance(x, dict):
-        return any(k in x for k in TEXT_KEYS)
-    if isinstance(x, list):
-        for el in x[:3]:
-            if isinstance(el, str) and el.strip():
-                return True
-            if isinstance(el, dict) and any(k in el for k in TEXT_KEYS):
-                return True
-        return False
-    return False
-
-def iter_paths(obj, max_depth=3):
-    """
-    Gera caminhos candidatos de até max_depth (prioriza chaves comuns).
-    """
-    from collections import deque
-    PRIORITY = ("clausulas","itens","metas","indicadores","lista","dados","conteudo","sections")
-    q = deque([("", obj, 0)])
-    while q:
-        path, cur, d = q.popleft()
-        yield path, cur
-        if d >= max_depth:
-            continue
-        if isinstance(cur, dict):
-            keys = list(cur.keys())
-            keys.sort(key=lambda k: (k not in PRIORITY, k))
-            for k in keys[:20]:
-                q.append((f"{path}.{k}" if path else k, cur[k], d+1))
-        elif isinstance(cur, list):
-            for i, el in enumerate(cur[:5]):
-                q.append((f"{path}.{i}" if path else str(i), el, d+1))
-
-def pick_best_path(obj, max_depth=3):
-    """
-    Escolhe o melhor caminho 'textual' dentro de obj.
-    Preferências: lista de dicts textuais > dict com campos textuais > lista de strings/números > simples.
-    Retorna (best_path, best_value).
-    """
-    best = (None, None, -1)  # (path, value, score)
-    for p, v in iter_paths(obj, max_depth=max_depth):
-        score = 0
-        if isinstance(v, list):
-            if v and all(isinstance(el, dict) for el in v[:min(3, len(v))]):
-                if any(any(k in el for k in TEXT_KEYS) for el in v[:min(5, len(v))]):
-                    score = 3
-                else:
-                    score = 2
-            elif any(isinstance(el, (str, int, float)) for el in v[:min(5, len(v))]):
-                score = 2
-        elif isinstance(v, dict):
-            if any(k in v for k in TEXT_KEYS):
-                score = 2
-            else:
-                score = 1
-        elif isinstance(v, (str, int, float)) and str(v).strip():
-            score = 1
-
-        if score > best[2]:
-            best = (p, v, score)
-    return best[0], best[1]
-
 # ========= Pydantic (request/response) =========
 class Selector(BaseModel):
     nome_hospital: str
@@ -290,6 +204,24 @@ def health():
 def list_json_vars():
     df = load_df()
     return {"json_vars": detectar_colunas_json(df)}
+
+@app.get("/listar_hospitais")
+def listar_hospitais(q: Optional[str] = Query(default=None, description="Filtro por nome (parcial)"),
+                     limit: int = Query(default=500, ge=1, le=10000)):
+    df = load_df()
+    if "nome_hospital" not in df.columns:
+        return {"total": 0, "items": []}
+
+    nomes = df["nome_hospital"].dropna().astype(str)
+
+    if q and q.strip():
+        alvo = norm(q)
+        nomes_norm = nomes.map(norm)
+        mask = nomes_norm.str.contains(alvo, regex=False, na=False)
+        nomes = nomes[mask]
+
+    nomes = nomes.drop_duplicates().sort_values().head(limit)
+    return {"total": int(nomes.shape[0]), "items": nomes.tolist()}
 
 @app.post("/avaliar_variaveis_json")
 def avaliar_variaveis_json(body: AvaliarVariaveisRequest):
@@ -336,45 +268,30 @@ def avaliar_variaveis_json(body: AvaliarVariaveisRequest):
 
     return {"ok": True, "hospital": {"nome_hospital": row.get("nome_hospital")}, "resultados": resultados}
 
-# ========= NOVOS ENDPOINTS: quadros comparativos (com paginação offset/limit) =========
+# ========= NOVOS ENDPOINTS: quadros comparativos =========
 @app.get("/quadro_variavel")
 def quadro_variavel(
     var: str = Query(..., description="Nome da coluna/variável (ex.: Metas, Pagamento, Indicadores de Qualidade)"),
     path: Optional[str] = Query(None, description="Caminho pontuado dentro do JSON (ex.: internacoes.2025.total)"),
     include_bruto: bool = Query(False, description="Se True, inclui o JSON bruto extraído"),
     max_chars: int = Query(400, ge=50, le=2000, description="Tamanho máximo do resumo textual por hospital"),
-    limit: int = Query(200, ge=1, le=10000, description="Quantos hospitais retornar"),
-    offset: int = Query(0, ge=0, description="Deslocamento (página) de hospitais"),
+    limit: int = Query(10000, ge=1, le=100000, description="Máximo de linhas (hospitais) retornadas"),
     sort: str = Query("none", pattern="^(asc|desc|none)$", description="Ordenação por resumo textual"),
 ):
     """
     Monta um 'quadro' (tabela) com a variável indicada para TODOS os hospitais.
     Não exige valores numéricos; serve para conteúdo qualitativo.
-    Suporta paginação via offset/limit.
     """
     df = load_df()
-    total_available = len(df)
     if var not in df.columns:
-        return {"total": 0, "columns": ["nome_hospital", var], "items": [], "error": f"Variável '{var}' não existe.",
-                "page": {"offset": offset, "limit": limit, "total_available": total_available}}
-
-    # paginação
-    df_page = df.iloc[offset: offset + limit]
+        return {"total": 0, "columns": ["nome_hospital", var], "items": [], "error": f"Variável '{var}' não existe."}
 
     items = []
-    for _, row in df_page.iterrows():
+    for _, row in df.head(limit).iterrows():
         nh = row.get("nome_hospital", "")
         raw = row.get(var, None)
         parsed = safe_parse_json(raw)
-        if parsed is not None:
-            if path and str(path).strip():
-                extracted = get_by_path(parsed, path)
-            else:
-                unwrapped = auto_unwrap(parsed)
-                bp, bv = pick_best_path(unwrapped, max_depth=3)
-                extracted = bv if bp is not None else unwrapped
-        else:
-            extracted = None
+        extracted = get_by_path(parsed, path) if parsed is not None else None
         resumo = summarize_value(extracted, max_chars=max_chars)
         item = {"nome_hospital": nh, "valor": resumo}
         if include_bruto:
@@ -385,12 +302,7 @@ def quadro_variavel(
         items = sorted(items, key=lambda x: (x["valor"] is None, str(x["valor"])), reverse=(sort == "desc"))
 
     cols = ["nome_hospital", "valor"] + (["bruto"] if include_bruto else [])
-    return {
-        "total": len(items),
-        "columns": cols,
-        "items": items,
-        "page": {"offset": offset, "limit": limit, "total_available": total_available}
-    }
+    return {"total": len(items), "columns": cols, "items": items}
 
 @app.post("/quadro_variaveis")
 def quadro_variaveis(
@@ -398,49 +310,29 @@ def quadro_variaveis(
     path: Optional[str] = Query(None, description="Caminho pontuado (opcional), aplicado a TODAS as variáveis"),
     include_bruto: bool = Query(False, description="Se True, inclui o JSON bruto extraído"),
     max_chars: int = Query(200, ge=50, le=2000, description="Resumo textual máximo por célula"),
-    limit: int = Query(200, ge=1, le=10000, description="Quantos hospitais retornar"),
-    offset: int = Query(0, ge=0, description="Deslocamento (página) de hospitais"),
+    limit: int = Query(10000, ge=1, le=100000, description="Máximo de hospitais"),
 ):
     """
     Tabelão 'largo': múltiplas variáveis por hospital.
     Para cada hospital e cada variável, cria uma coluna com o resumo textual.
-    Suporta paginação via offset/limit.
     """
     df = load_df()
-    total_available = len(df)
     for v in vars:
         if v not in df.columns:
-            return {"total": 0, "columns": [], "items": [], "error": f"Variável '{v}' não existe.",
-                    "page": {"offset": offset, "limit": limit, "total_available": total_available}}
-
-    # paginação
-    df_page = df.iloc[offset: offset + limit]
+            return {"total": 0, "columns": [], "items": [], "error": f"Variável '{v}' não existe."}
 
     items = []
-    for _, row in df_page.iterrows():
+    for _, row in df.head(limit).iterrows():
         nh = row.get("nome_hospital", "")
         out_row: Dict[str, Any] = {"nome_hospital": nh}
         for v in vars:
             raw = row.get(v, None)
             parsed = safe_parse_json(raw)
-            if parsed is not None:
-                if path and str(path).strip():
-                    extracted = get_by_path(parsed, path)
-                else:
-                    unwrapped = auto_unwrap(parsed)
-                    bp, bv = pick_best_path(unwrapped, max_depth=3)
-                    extracted = bv if bp is not None else unwrapped
-            else:
-                extracted = None
+            extracted = get_by_path(parsed, path) if parsed is not None else None
             out_row[v] = summarize_value(extracted, max_chars=max_chars)
             if include_bruto:
                 out_row[f"{v}__bruto"] = extracted
         items.append(out_row)
 
     columns = ["nome_hospital"] + vars + ([f"{v}__bruto" for v in vars] if include_bruto else [])
-    return {
-        "total": len(items),
-        "columns": columns,
-        "items": items,
-        "page": {"offset": offset, "limit": limit, "total_available": total_available}
-    }
+    return {"total": len(items), "columns": columns, "items": items}
